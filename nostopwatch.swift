@@ -3,7 +3,7 @@ import Speech
 import AVFoundation
 import AVFAudio
 
-// MARK: - Speech recognizer for digits (faster-feel tweaks baked in)
+// MARK: - Speech recognizer for digits (fast + robust)
 class DigitRecognizer: ObservableObject {
     @Published var transcript = ""
     @Published var digitCount = 0
@@ -11,7 +11,7 @@ class DigitRecognizer: ObservableObject {
 
     private let recognizer: SFSpeechRecognizer? = {
         let r = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
-        if #available(iOS 16.0, *) { r?.defaultTaskHint = .dictation } // hint for short words
+        if #available(iOS 16.0, *) { r?.defaultTaskHint = .dictation } // better for short tokens
         return r
     }()
 
@@ -19,50 +19,45 @@ class DigitRecognizer: ObservableObject {
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
 
-    // To avoid duplicate appends when partial results repeat the same last segment
+    // Prevent duplicate appends & post-stop “final” callbacks
     private var lastAppendedTimestamp: TimeInterval = -1
 
     func startRecording() {
         // Permissions
         SFSpeechRecognizer.requestAuthorization { _ in }
         if #available(iOS 17.0, *) {
-            switch AVAudioApplication.shared.recordPermission {
-            case .undetermined:
+            if AVAudioApplication.shared.recordPermission == .undetermined {
                 AVAudioApplication.requestRecordPermission { _ in }
-            default: break
             }
         } else {
             AVAudioSession.sharedInstance().requestRecordPermission { _ in }
         }
 
-        if audioEngine.isRunning { stopRecording() } // clean restart
+        if audioEngine.isRunning { stopRecording() }   // clean restart
 
         transcript = ""
         digitCount = 0
-        isRecording = true
         lastAppendedTimestamp = -1
+        isRecording = true
 
-        // Audio session tuned for low latency
+        // Low-latency audio session
         let session = AVAudioSession.sharedInstance()
         try? session.setCategory(.record, mode: .measurement, options: .duckOthers)
-        // These preferred settings help reduce end-to-end lag a bit
         try? session.setPreferredSampleRate(44_100)
-        try? session.setPreferredIOBufferDuration(0.005) // ~5ms target
+        try? session.setPreferredIOBufferDuration(0.005) // ~5ms
         try? session.setActive(true, options: .notifyOthersOnDeactivation)
 
-        // Request
         let req = SFSpeechAudioBufferRecognitionRequest()
-        req.shouldReportPartialResults = true                  // explicit partials
-        if #available(iOS 13.0, *) { req.requiresOnDeviceRecognition = false } // allow server if it helps
+        req.shouldReportPartialResults = true
+        if #available(iOS 13.0, *) { req.requiresOnDeviceRecognition = false } // allow server if faster
         request = req
 
         guard let request = request else { return }
 
-        // Stream mic → request
+        // Mic → request
         let input = audioEngine.inputNode
         let format = input.outputFormat(forBus: 0)
         input.removeTap(onBus: 0)
-        // Smaller buffer → more frequent callbacks (tradeoff: a touch more CPU)
         input.installTap(onBus: 0, bufferSize: 256, format: format) { buffer, _ in
             request.append(buffer)
         }
@@ -71,13 +66,15 @@ class DigitRecognizer: ObservableObject {
         try? audioEngine.start()
 
         recognitionTask = recognizer?.recognitionTask(with: request) { [weak self] result, _ in
-            guard let self = self, let result = result else { return }
+            guard let self = self else { return }
+            // 🔒 Ignore any callbacks after Stop was pressed
+            guard self.isRecording else { return }
+            guard let result = result, let seg = result.bestTranscription.segments.last else { return }
 
-            guard let lastSeg = result.bestTranscription.segments.last else { return }
-            // Skip if we already appended this exact segment (partial results often repeat it)
-            if lastSeg.timestamp == self.lastAppendedTimestamp { return }
+            // ⛔️ Skip duplicates (partials often repeat same last segment)
+            if seg.timestamp == self.lastAppendedTimestamp { return }
 
-            let token = lastSeg.substring.lowercased()
+            let token = seg.substring.lowercased()
             let mapped: String?
             switch token {
             case "zero", "0": mapped = "0"
@@ -94,7 +91,7 @@ class DigitRecognizer: ObservableObject {
             }
 
             if let d = mapped {
-                self.lastAppendedTimestamp = lastSeg.timestamp
+                self.lastAppendedTimestamp = seg.timestamp
                 DispatchQueue.main.async {
                     self.transcript.append(d)
                     self.digitCount = self.transcript.count
@@ -104,12 +101,17 @@ class DigitRecognizer: ObservableObject {
     }
 
     func stopRecording() {
+        // Flip this first so late callbacks are ignored
         isRecording = false
+
         audioEngine.stop()
         request?.endAudio()
         recognitionTask?.cancel()
         audioEngine.inputNode.removeTap(onBus: 0)
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+
+        recognitionTask = nil
+        request = nil
     }
 
     func reset() {
@@ -125,11 +127,11 @@ struct ContentView: View {
     @StateObject private var recognizer = DigitRecognizer()
     @State private var now = Date()
     private let clock = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
-
+    
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-
+            
             VStack {
                 // Two balanced columns
                 HStack(alignment: .center) {
@@ -138,31 +140,32 @@ struct ContentView: View {
                         Text("Digits Recited")
                             .font(.title)
                             .foregroundColor(.white)
-
+                        
                         Text("\(recognizer.digitCount)")
                             .font(.system(size: 220, weight: .bold, design: .rounded))
                             .monospacedDigit()
                             .foregroundColor(.yellow)
                             .lineLimit(1)
                             .minimumScaleFactor(0.3)
-
+                        
+                        // Bigger transcript for camera legibility
                         ScrollView {
                             Text(recognizer.transcript)
-                                .font(.title)
+                                .font(.title)   // ~50% larger than earlier
                                 .foregroundColor(.white)
                                 .padding(.horizontal)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }
-                        .frame(maxHeight: 120)
+                        .frame(maxHeight: 160)
                     }
                     .frame(maxWidth: .infinity)
-
+                    
                     // Center divider
                     Rectangle()
                         .fill(Color.white.opacity(0.7))
                         .frame(width: 2)
                         .padding(.vertical, 30)
-
+                    
                     // RIGHT: Time + Date
                     VStack(spacing: 36) {
                         VStack(spacing: 6) {
@@ -174,22 +177,22 @@ struct ContentView: View {
                                 .foregroundColor(.green)
                                 .monospacedDigit()
                         }
-
+                        
                         VStack(spacing: 8) {
                             Text("Today's Date")
                                 .font(.headline)
                                 .foregroundColor(.white)
                             Text(dateLong(now))
-                                .font(.title)
+                                .font(.title)   // bigger date text
                                 .foregroundColor(.cyan)
                         }
                     }
                     .frame(maxWidth: .infinity)
                 }
                 .padding(.horizontal)
-
+                
                 Spacer(minLength: 16)
-
+                
                 // Bottom row: Reset (right) + Start/Stop (center)
                 HStack {
                     Spacer()
@@ -206,7 +209,7 @@ struct ContentView: View {
                 }
                 .padding(.horizontal, 20)
                 .padding(.bottom, 20)
-
+                
                 Button {
                     if recognizer.isRecording {
                         recognizer.stopRecording()
@@ -226,7 +229,7 @@ struct ContentView: View {
         }
         .onReceive(clock) { now = $0 }
     }
-
+    
     // MARK: - Formatters (Dublin, OH = America/New_York)
     private func time12h(_ date: Date) -> String {
         let f = DateFormatter()
@@ -234,7 +237,7 @@ struct ContentView: View {
         f.dateFormat = "hh:mm:ss a"   // 12-hour + AM/PM
         return f.string(from: date)
     }
-
+    
     private func dateLong(_ date: Date) -> String {
         let f = DateFormatter()
         f.timeZone = TimeZone(identifier: "America/New_York")
@@ -242,4 +245,3 @@ struct ContentView: View {
         return f.string(from: date)
     }
 }
-
